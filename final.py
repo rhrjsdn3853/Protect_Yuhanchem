@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog,
-    QMessageBox, QTextEdit, QInputDialog, QTabWidget, QMainWindow, QProgressBar, QCheckBox, QLineEdit
+    QMessageBox, QTextEdit, QInputDialog, QTabWidget, QMainWindow, QProgressBar, QCheckBox, QLineEdit,QHeaderView
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QFont, QTextCursor
@@ -205,6 +205,24 @@ class AnalysisThread(QThread):
                 "Attack_Type": row['Attack_Type'],
                 **ip_info_cache.get(ip, {})
             })
+
+        cache = load_cache()
+        now = datetime.now(timezone.utc).isoformat()
+        for entry in enriched:
+            ip = entry["IP"]
+            cache_entry = cache.get(ip, {"ts": now, "data": {}})
+            # 1) ts 유지 또는 초기화
+            cache_entry["ts"] = cache_entry.get("ts", now)
+            # 2) VT 결과 전체 저장
+            cache_entry["data"] = entry
+            # 3) 출처와 위협유형
+            cache_entry["source"]      = self.mode
+            cache_entry["threat_type"] = entry["Attack_Type"]
+            # 4) Malicious ≥ 1 이면 'V' 로 차단 표시
+            mal = entry.get("Malicious", 0)
+            cache_entry["blocked"] = "V" if isinstance(mal, (int, float)) and mal >= 1 else ""
+            cache[ip] = cache_entry
+        save_cache(cache)
         return pd.DataFrame(enriched), blocked_count
 
     def process_waf(self, path):
@@ -244,6 +262,20 @@ class AnalysisThread(QThread):
                 "룰": rules_joined,
                 **info
             })
+        cache = load_cache()
+        now = datetime.now(timezone.utc).isoformat()
+        for entry in results:
+            ip = entry["출발지 주소"]
+            cache_entry = cache.get(ip, {"ts": now, "data": {}})
+            cache_entry["ts"]          = cache_entry.get("ts", now)
+            cache_entry["data"]        = entry
+            cache_entry["source"]      = "웹방화벽"
+            cache_entry["threat_type"] = entry["룰"]
+            # Malicious 통계 보고 차단 여부 결정
+            mal = entry.get("Malicious", 0)
+            cache_entry["blocked"]     = "V" if mal >= 1 else ""
+            cache[ip] = cache_entry
+        save_cache(cache)
 
         return pd.DataFrame(results), removed_count
 
@@ -292,6 +324,7 @@ class HistoryTab(QWidget):
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.setFont(QFont("Segoe UI", 10))
         self.layout().addWidget(self.table, 1)
+        
 
         # ── 시그널 연결 ──
         self.btn_export.clicked.connect(self.export_log)
@@ -300,6 +333,13 @@ class HistoryTab(QWidget):
 
         self.load_history()
         self.apply_styles()
+    
+    def append_entry(self, line: str):
+        ts, msg = line.strip().split(" ", 1)
+        time_item = QStandardItem(ts)
+        msg_item  = QStandardItem(msg)
+        time_item.setTextAlignment(Qt.AlignCenter)
+        self.model.appendRow([time_item, msg_item])
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -369,43 +409,59 @@ class CacheTab(QWidget):
         btn_layout.setContentsMargins(0, 0, 0, 0)
 
         self.btn_refresh = QPushButton(QIcon("icons/refresh.png"), "새로고침")
-        self.btn_delete  = QPushButton(QIcon("icons/delete.png"),  "선택 삭제")
-        self.btn_clear   = QPushButton(QIcon("icons/clear.png"),   "전체 초기화")
-        for btn in (self.btn_refresh, self.btn_delete, self.btn_clear):
+        self.btn_export = QPushButton(QIcon("icons/export.png"), "엑셀 추출")
+        self.btn_delete = QPushButton(QIcon("icons/delete.png"),  "선택 삭제")
+        self.btn_clear  = QPushButton(QIcon("icons/clear.png"),   "전체 초기화")
+        for btn in (self.btn_refresh, self.btn_export, self.btn_delete, self.btn_clear):
             btn.setIconSize(QSize(20,20))
             btn.setCursor(Qt.PointingHandCursor)
             btn.setMinimumHeight(30)
+            btn.setFixedWidth(90)
             btn_layout.addWidget(btn)
 
         btn_layout.addStretch()
-
+        btn_layout.addWidget(QLabel("날짜 검색:"))
         self.search = QLineEdit()
-        self.search.setPlaceholderText("IP 또는 Timestamp 검색")
+        self.search.setPlaceholderText("내용 검색")
         self.search.setFixedWidth(200)
-        btn_layout.addWidget(QLabel("검색:"))
         btn_layout.addWidget(self.search)
 
         self.layout().addWidget(button_bar)
 
-        # ── 테이블 뷰 ──
-        self.model = QStandardItemModel(0, 2, self)
-        self.model.setHorizontalHeaderLabels(["IP 주소", "DATETIME"])
+        # ── 테이블 뷰 (2열) ──
+        self.model = QStandardItemModel(0, 5, self)
+        self.model.setHorizontalHeaderLabels([
+            "IP 주소", "날짜", "출처", "위협 유형", "차단됨"
+        ])
         self.proxy = QSortFilterProxyModel(self)
         self.proxy.setSourceModel(self.model)
-        self.proxy.setFilterKeyColumn(-1)
+        self.proxy.setFilterKeyColumn(1)
 
         self.table = QTableView()
         self.table.setModel(self.proxy)
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.setFont(QFont("Segoe UI", 10))
+
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Fixed)   # IP
+        hdr.setSectionResizeMode(1, QHeaderView.Fixed)   # 날짜
+        hdr.setSectionResizeMode(2, QHeaderView.Fixed)   # 출처
+        hdr.setSectionResizeMode(3, QHeaderView.Stretch) # 위협 유형
+        hdr.setSectionResizeMode(4, QHeaderView.Fixed)   # 차단됨
+
+        self.table.setColumnWidth(0, 150)
+        self.table.setColumnWidth(1, 100)
+        self.table.setColumnWidth(2, 100)
+        self.table.setColumnWidth(4, 60)
+
         self.layout().addWidget(self.table, 1)
 
-        # ── 시그널 연결 ──
+        # ── 시그널 연결 & 초기 로드 ──
         self.btn_refresh.clicked.connect(self.load_cache)
+        self.btn_export.clicked.connect(self.export_cache_to_excel)
         self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_clear.clicked.connect(self.clear_all)
         self.search.textChanged.connect(self.proxy.setFilterFixedString)
@@ -419,9 +475,7 @@ class CacheTab(QWidget):
                 background-color: #1976d2; color: white; border: none;
                 padding: 6px 12px; border-radius: 4px;
             }
-            QPushButton:hover {
-                background-color: #1565c0;
-            }
+            QPushButton:hover { background-color: #1565c0; }
             QLineEdit {
                 padding: 4px; border: 1px solid #ccc; border-radius: 4px;
             }
@@ -436,26 +490,99 @@ class CacheTab(QWidget):
         """)
 
     def load_cache(self):
+        """vt_cache.json 에서 IP·날짜·출처·위협유형·차단됨을 읽어 테이블에 표시"""
         self.model.removeRows(0, self.model.rowCount())
-        cache = {}
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                cache = json.load(f)
+
+        if not os.path.exists(CACHE_FILE):
+            return
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+
         for ip, entry in cache.items():
-            row = [QStandardItem(ip), QStandardItem(entry.get("ts", ""))]
-            for item in row:
-                item.setTextAlignment(Qt.AlignCenter)
-            self.model.appendRow(row)
+            # 1) 날짜만 분리
+            ts_full = entry.get("ts", "")
+            date    = ts_full.split("T",1)[0] if "T" in ts_full else ts_full[:10]
+
+            # 2) 메타 필드
+            source      = entry.get("source", "")
+            threat_type = entry.get("threat_type", "")
+            blocked     = entry.get("blocked", "")
+
+            # 3) 5개 컬럼 생성
+            items = []
+            for text in (ip, date, source, threat_type, blocked):
+                it = QStandardItem(text)
+                it.setTextAlignment(Qt.AlignCenter)
+                items.append(it)
+
+            self.model.appendRow(items)
+
+    def export_cache_to_excel(self):
+        """IP, 날짜, 출처, 위협 유형, 차단됨 5개 열을 전부 엑셀로 저장"""
+        if not os.path.exists(CACHE_FILE):
+            QMessageBox.information(self, "내보내기", "캐시 파일이 없습니다.")
+            return
+
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+
+        # 5개 컬럼을 모두 꺼내서 리스트 of dict 생성
+        records = []
+        for ip, entry in cache.items():
+            ts_full     = entry.get("ts", "")
+            date        = ts_full.split("T",1)[0] if "T" in ts_full else ts_full[:10]
+            source      = entry.get("source", "")
+            threat_type = entry.get("threat_type", "")
+            blocked     = entry.get("blocked", "")
+
+            records.append({
+                "IP 주소": ip,
+                "날짜": date,
+                "출처": source,
+                "위협 유형": threat_type,
+                "차단됨": blocked
+            })
+
+        df = pd.DataFrame(records)
+        if df.empty:
+            QMessageBox.information(self, "내보내기", "내보낼 데이터가 없습니다.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "엑셀로 저장", "cache_export.xlsx", "Excel Files (*.xlsx)"
+        )
+        if not path:
+            return
+
+        try:
+            # 1) DataFrame → 엑셀
+            df.to_excel(path, index=False)
+
+            # 2) 열 너비 자동 조절
+            wb = load_workbook(path)
+            ws = wb.active
+            for col_cells in ws.columns:
+                max_len = max(len(str(cell.value)) if cell.value else 0 for cell in col_cells)
+                col_letter = get_column_letter(col_cells[0].column)
+                ws.column_dimensions[col_letter].width = max_len + 2
+            wb.save(path)
+
+            QMessageBox.information(self, "완료", f"캐시가 엑셀로 저장되었습니다:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"저장 실패:\n{e}")
 
     def delete_selected(self):
         sel = self.table.selectionModel().selectedRows()
         if not sel:
             return
-        ips = [self.proxy.data(idx) for idx in sel]
         with open(CACHE_FILE, 'r', encoding='utf-8') as f:
             cache = json.load(f)
-        for ip in ips:
+
+        # 선택된 IP만 삭제
+        for idx in sel:
+            ip = self.proxy.index(idx.row(), 0).data()
             cache.pop(ip, None)
+
         with open(CACHE_FILE, 'w', encoding='utf-8') as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
         self.load_cache()
@@ -749,11 +876,12 @@ class JsonToExcelTab(QWidget):
                 {
                     "위협 IP": item.get("threat_info"),
                     "정책 구분": item.get("policy_div"),
-                    "위협 사유": item.get("reason_div").strip() if item.get("reason_div") else None
+                    "위협 사유": item.get("reason_div").strip() if item.get("reason_div") else ""
                 }
                 for item in json_data.get("datas", [])
             ]
 
+            # 1) Excel 변환
             df = pd.DataFrame(filtered_data)
             output_file = self.file_path.replace('.json', '_output.xlsx')
             df.to_excel(output_file, index=False)
@@ -769,8 +897,26 @@ class JsonToExcelTab(QWidget):
                 cell.font = ExcelFont(bold=True)
             wb.save(output_file)
 
-            self.main_window.result_files.append(output_file)  # ✅ 수정된 부분
+            # ── 캐시에 동일하게 저장 ──
+            cache = load_cache()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for rec in filtered_data:
+                ip = rec["위협 IP"]
+                if not ip:
+                    continue
+                cache[ip] = {
+                    "ts": now_iso,
+                    "data": rec,
+                    "source": "JSON",             # 필요에 따라 변경
+                    "threat_type": rec["위협 사유"],
+                    "blocked": "V"                 # JSON 변환분은 차단정보 없음
+                }
+            save_cache(cache)
+
+            # 결과 알림
+            self.main_window.result_files.append(output_file)
             QMessageBox.information(self, "✅ 완료", f"Excel로 변환됨:\n{output_file}")
+
         except Exception as e:
             QMessageBox.critical(self, "오류", str(e))
 
@@ -968,7 +1114,7 @@ class MainWindow(QMainWindow):
         border-top-left-radius: 8px;
         border-top-right-radius: 8px;
         margin-right: 3.3px;
-        width:81.2px
+        width:95px
     }
     QTabBar::tab:selected {
         background: #1976d2;
