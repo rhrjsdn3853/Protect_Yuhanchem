@@ -41,6 +41,36 @@ API_KEYS = load_api_keys_from_env()
 CACHE_FILE = 'vt_cache.json'
 CACHE_TTL = timedelta(hours=24)
 
+
+WHITELIST_FILE = 'whitelist.txt'  # 한 줄당 1개: 단일 IP 또는 CIDR
+
+def load_whitelist(path: str = WHITELIST_FILE):
+    """whitelist.txt에서 단일 IP 또는 CIDR을 읽어 ip_network들의 리스트로 리턴"""
+    nets = []
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#'):
+                    continue
+                try:
+                    # 단일 IP면 /32로 처리
+                    if '/' not in line:
+                        nets.append(ip_network(f"{line}/32", strict=False))
+                    else:
+                        nets.append(ip_network(line, strict=False))
+                except Exception:
+                    # 잘못된 라인은 무시
+                    pass
+    return nets
+
+def is_whitelisted(ip: str, wl_networks) -> bool:
+    try:
+        ip_obj = ip_address(ip)
+        return any(ip_obj in net for net in wl_networks)
+    except Exception:
+        return False
+
 def load_cache():
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, 'r', encoding='utf-8') as f:
@@ -58,10 +88,11 @@ class AnalysisThread(QThread):
     error = pyqtSignal(str)
     progress = pyqtSignal(int, str)  # percent, current_ip
 
-    def __init__(self, path, mode, parent=None):
+    def __init__(self, path, mode, whitelist_networks=None, parent=None):
         super().__init__(parent)
         self.path = path
         self.mode = mode
+        self.whitelist_networks = whitelist_networks or []
 
     def run(self):
         try:
@@ -75,7 +106,8 @@ class AnalysisThread(QThread):
                 df, count = self.process_waf(self.path)
                 stats_msg = f"🧹 제거된 대응 패턴 건수: {count}건"
 
-            output_file = self.path.replace('.csv', '_result.xlsx')
+            base, _ = os.path.splitext(self.path)
+            output_file = f"{base}_result.xlsx"
             df.to_excel(output_file, index=False)
 
             wb = load_workbook(output_file)
@@ -97,7 +129,9 @@ class AnalysisThread(QThread):
             raise ValueError(f"알 수 없는 모드: {mode}")
 
         # 1) 중복 제거
+        ip_list = [ip for ip in ip_list if not is_whitelisted(ip, self.whitelist_networks)]
         unique_ips = list(dict.fromkeys(ip_list))
+        
 
         # 2) 캐시 로드 & TTL 검사
         cache = load_cache()
@@ -180,13 +214,13 @@ class AnalysisThread(QThread):
 
 
 
-
     def process_ips(self, path):
         df = pd.read_csv(path, encoding='utf-8', sep='\t')
         df = df.fillna('').astype(str)
         df = df.apply(lambda col: col.str.strip().str.replace('\n', '', regex=False))
         df['공격자_IP'] = df['공격자'].apply(lambda x: re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', x).group(1) if re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', x) else '')
         df = df[~df['공격자_IP'].str.startswith(('10.20.', '10.30.', '10.40.', '192.168.10.', '10.1.'))].copy()
+        df = df[~df['공격자_IP'].apply(lambda x: is_whitelisted(x, self.whitelist_networks))].copy()
         df['차단'] = df['차단'].str.strip().str.upper()
         blocked_count = df[df['차단'] == 'V'].shape[0]
         df = df[df['차단'] != 'V']
@@ -234,6 +268,7 @@ class AnalysisThread(QThread):
         df = df[df['출발지 주소'].apply(lambda x: bool(re.match(r'^(\d{1,3}\.){3}\d{1,3}$', str(x))))]
         df['출발지_IP'] = df['출발지 주소'].apply(lambda x: re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', str(x)).group(1) if re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', str(x)) else '')
         df = df[~df['출발지_IP'].str.startswith(('10.20.', '10.30.', '10.40.', '192.168.10.', '10.1.'))]
+        df = df[~df['출발지_IP'].apply(lambda x: is_whitelisted(x, self.whitelist_networks))].copy()
         df = df[['룰', '출발지 주소', '대응']]
         patterns_to_remove = ['연결 끊기', '오류 코드', '페이지 리다이렉션', '사용자 페이지']
         removed_count = df['대응'].str.contains('|'.join(patterns_to_remove), na=False).sum()
@@ -781,7 +816,7 @@ QCheckBox::indicator:checked {
             self.status_labels[mode].setText("🔄 분석 준비 중...")
             self.progress_bars[mode].setValue(0)
 
-            thread = AnalysisThread(path, mode)
+            thread = AnalysisThread(path, mode, whitelist_networks=self.main_window.whitelist_networks)
             thread.progress.connect(lambda p, ip, m=mode: self.update_progress(p, ip, m))
             thread.finished.connect(lambda msg, file, m=mode: self.on_analysis_done(msg, file, m))
             thread.error.connect(lambda err, m=mode: self.on_analysis_error(err, m))
@@ -881,6 +916,12 @@ class JsonToExcelTab(QWidget):
                 for item in json_data.get("datas", [])
             ]
 
+            wl = self.main_window.whitelist_networks
+            filtered_data = [
+                rec for rec in filtered_data
+                if rec.get("위협 IP") and not is_whitelisted(rec["위협 IP"], wl)
+            ]
+
             # 1) Excel 변환
             df = pd.DataFrame(filtered_data)
             output_file = self.file_path.replace('.json', '_output.xlsx')
@@ -907,7 +948,7 @@ class JsonToExcelTab(QWidget):
                 cache[ip] = {
                     "ts": now_iso,
                     "data": rec,
-                    "source": "JSON",             # 필요에 따라 변경
+                    "source": "C-TAS",             # 필요에 따라 변경
                     "threat_type": rec["위협 사유"],
                     "blocked": "V"                 # JSON 변환분은 차단정보 없음
                 }
@@ -1004,6 +1045,8 @@ class CLIGeneratorTab(QWidget):
         try:
             df = pd.read_excel(self.input_file)
             ip_list = df['위협 IP'].dropna().unique().tolist()
+            wl = self.main_window.whitelist_networks
+            ip_list = [ip for ip in ip_list if not is_whitelisted(ip, wl)]
         except Exception as e:
             self.log(f"❌ 엑셀 파일 오류: {e}")
             return
@@ -1100,6 +1143,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("💻 보안 자동화 도구 통합판")
         self.setGeometry(200, 200, 640, 500)
         self.result_files = []  # 📁 생성된 결과 파일들 기록
+        self.whitelist_networks = load_whitelist()  # ⬅️ 시작 시 1회 로드
         
 
 
@@ -1168,9 +1212,22 @@ class MainWindow(QMainWindow):
 """)
         main_layout.addWidget(btn_export_all)
 
+
+        btn_load_wl = QPushButton("⚪ 화이트리스트 불러오기")
+        btn_load_wl.setToolTip("whitelist.txt(단일IP 또는 CIDR)에서 다시 로드")
+        btn_load_wl.clicked.connect(self.reload_whitelist)
+        main_layout.addWidget(btn_load_wl)
+
+
         wrapper = QWidget()
         wrapper.setLayout(main_layout)
         self.setCentralWidget(wrapper)
+
+
+    def reload_whitelist(self):
+        # whitelist.txt 기본 경로 사용. 필요하면 파일 선택 다이얼로그로 바꿔도 됨.
+        self.whitelist_networks = load_whitelist()
+        QMessageBox.information(self, "화이트리스트", f"로드 완료: {len(self.whitelist_networks)}개 네트워크")
 
     def detect_source(self, file_path, df):
         lower = file_path.lower()
@@ -1189,112 +1246,199 @@ class MainWindow(QMainWindow):
             return "알수없음"
 
     def export_all_ips(self):
-        new_data = []
+        def valid_ipv4(s: str) -> bool:
+            return bool(re.match(r'^(\d{1,3}\.){3}\d{1,3}$', str(s).strip()))
+        def split_ips(field: str):
+            # C-TAS 등에서 "IP1, IP2 ; IP3" 같은 형태 분리
+            raw = str(field or "")
+            parts = re.split(r'[,\s;]+', raw)
+            return [p for p in (x.strip() for x in parts) if valid_ipv4(p)]
+        def merge_sources(series):
+            seen = []
+            for item in series.astype(str):
+                for src in re.split(r'\s*,\s*', item):
+                    s = src.strip()
+                    if s and s not in seen:
+                        seen.append(s)
+            return ", ".join(seen)
+        def merge_types(series):
+            # "SQLi, XSS" 같은 문자열들을 토큰 단위로 합쳐 중복 제거
+            tokens = set()
+            for item in series.astype(str):
+                if not item:
+                    continue
+                for t in re.split(r'\s*,\s*', item):
+                    tt = t.strip()
+                    if tt:
+                        tokens.add(tt)
+            return ", ".join(sorted(tokens))
 
-        # 1) 각 결과 파일에서 데이터 수집할 때 Malicious 값도 함께 담기
+        # ------------ 수집 ------------
+        collected = []
+        files_used = 0
+        rows_read  = 0
+        wl = self.whitelist_networks
+
         for entry in self.result_files:
             file_path = entry.get("path") if isinstance(entry, dict) else entry
             forced_source = entry.get("source") if isinstance(entry, dict) else None
+            if not file_path or not os.path.exists(file_path):
+                continue
 
             try:
                 df = pd.read_excel(file_path)
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                source = forced_source or self.detect_source(file_path, df)
-
-                for _, row in df.iterrows():
-                    malicious = row.get("Malicious", 0)
-                    if "위협 IP" in df.columns and "위협 사유" in df.columns:
-                        ip = row["위협 IP"]
-                        ttype = row.get("위협 사유", "")
-                    elif "IP" in df.columns and "Attack_Type" in df.columns:
-                        ip = row["IP"]
-                        ttype = row.get("Attack_Type", "")
-                    elif "출발지 주소" in df.columns and "룰" in df.columns:
-                        ip = row["출발지 주소"]
-                        ttype = row.get("룰", "")
-                    else:
-                        continue
-
-                    new_data.append({
-                        "출처": source,
-                        "위협 IP": ip,
-                        "위협 유형": ttype,
-                        "분석 일시": now,
-                        "Malicious": malicious
-                    })
-
+                files_used += 1
             except Exception as e:
                 QMessageBox.warning(self, "⚠️ 읽기 실패", f"{file_path} 에서 오류: {e}")
+                continue
 
-        if not new_data:
+            src = forced_source or self.detect_source(file_path, df)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows_read += len(df)
+
+            # 소스별 컬럼 스키마 정규화
+            if {"위협 IP", "위협 사유"}.issubset(df.columns):
+                # C-TAS: 한 셀에 다중 IP 가능 → 분리
+                for _, row in df.iterrows():
+                    ips = split_ips(row.get("위협 IP", ""))
+                    reason = (row.get("위협 사유") or "").strip()
+                    for ip in ips:
+                        if is_whitelisted(ip, wl):
+                            continue
+                        collected.append({
+                            "출처": src,
+                            "위협 IP": ip,
+                            "위협 유형": reason,
+                            "분석 일시": now,
+                            "Malicious": 0
+                        })
+
+            elif {"IP", "Attack_Type"}.issubset(df.columns):
+                # AIPS/HIPS
+                for _, row in df.iterrows():
+                    ip = str(row.get("IP", "")).strip()
+                    if not valid_ipv4(ip) or is_whitelisted(ip, wl):
+                        continue
+                    collected.append({
+                        "출처": src,
+                        "위협 IP": ip,
+                        "위협 유형": (row.get("Attack_Type") or "").strip(),
+                        "분석 일시": now,
+                        "Malicious": int(row.get("Malicious", 0) or 0)
+                    })
+
+            elif {"출발지 주소", "룰"}.issubset(df.columns):
+                # 웹방화벽
+                for _, row in df.iterrows():
+                    ip = str(row.get("출발지 주소", "")).strip()
+                    if not valid_ipv4(ip) or is_whitelisted(ip, wl):
+                        continue
+                    collected.append({
+                        "출처": src,
+                        "위협 IP": ip,
+                        "위협 유형": (row.get("룰") or "").strip(),
+                        "분석 일시": now,
+                        "Malicious": int(row.get("Malicious", 0) or 0)
+                    })
+
+            else:
+                QMessageBox.warning(self, "⚠️ 스키마 미인식",
+                                    f"{file_path}\n인식 가능한 컬럼 구성이 아닙니다.")
+
+        if not collected:
             QMessageBox.information(self, "📭 없음", "수집된 IP가 없습니다.")
             return
 
-        # 2) DataFrame 생성
-        df_new = pd.DataFrame(new_data)
+        df_new = pd.DataFrame(collected)
+
+        # === 1) 출력 대상: 현재 폴더의 all_threat_ips.xlsx를 우선 사용 ===
         output_file = os.path.join(os.getcwd(), "all_threat_ips.xlsx")
 
-        # 3) 기존 파일이 있으면 합치기
+        prev = None
         if os.path.exists(output_file):
             try:
-                df_existing = pd.read_excel(output_file)
-                df_all = pd.concat([df_existing, df_new], ignore_index=True)
+                # 안전하게 백업
+                backup = output_file.replace(".xlsx", f"_backup_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+                shutil.copy2(output_file, backup)
+
+                prev = pd.read_excel(output_file)
             except Exception as e:
-                QMessageBox.critical(self, "❌ 파일 읽기 오류", f"기존 통합 파일을 열 수 없습니다:\n{e}")
+                QMessageBox.critical(self, "❌ 파일 읽기 오류", f"기존 all_threat_ips.xlsx를 열 수 없습니다:\n{e}")
                 return
+
+        # === 2) 컬럼 호환성 보정 ===
+        need_cols = ["출처", "위협 IP", "위협 유형", "분석 일시", "Malicious"]
+        if prev is None:
+            df_all = df_new.copy()
         else:
-            df_all = df_new
+            for c in need_cols:
+                if c not in prev.columns:
+                    prev[c] = "" if c != "Malicious" else 0
+            df_all = pd.concat([prev[need_cols], df_new[need_cols]], ignore_index=True)
 
-        # 4) 출처 문자열화
-        df_all["출처"] = df_all["출처"].fillna("").astype(str)
-
-        # 5) 그룹핑하면서 집계: 출처는 merge, 분석 일시는 최신, Malicious는 최대
+        # === 3) 정규화/집계(기존 코드 그대로) ===
         def merge_sources(series):
             seen = []
-            for item in series:
-                for src in re.split(r'\s*,\s*', str(item)):
+            for item in series.astype(str):
+                for src in re.split(r'\s*,\s*', item):
                     s = src.strip()
                     if s and s not in seen:
                         seen.append(s)
             return ", ".join(seen)
 
-        df_all = (
+        def merge_types(series):
+            tokens = set()
+            for item in series.astype(str):
+                if not item:
+                    continue
+                for t in re.split(r'\s*,\s*', item):
+                    tt = t.strip()
+                    if tt:
+                        tokens.add(tt)
+            return ", ".join(sorted(tokens))
+
+        df_all["출처"] = df_all["출처"].fillna("").astype(str)
+        df_all["위협 유형"] = df_all["위협 유형"].fillna("").astype(str)
+        df_all["Malicious"] = pd.to_numeric(df_all["Malicious"], errors="coerce").fillna(0).astype(int)
+
+        agg = (
             df_all
-            .groupby(["위협 IP", "위협 유형"], as_index=False)
+            .groupby("위협 IP", as_index=False)
             .agg({
                 "출처": merge_sources,
+                "위협 유형": merge_types,
                 "분석 일시": "max",
-                "Malicious": "max"
+                "Malicious": "max",
             })
         )
 
-        # 6) 차단됨 컬럼 추가:
-        #    - C-TAS 출처면 무조건 'V'
-        #    - 그 외에는 Malicious ≥ 1 → 'V'
-        def is_blocked(row):
-            if "C-TAS" in row["출처"]:
-                return "V"
-            return "V" if row["Malicious"] >= 1 else ""
+        def decide_block(row):
+            return "V" if ("C-TAS" in row["출처"] or row["Malicious"] >= 1) else ""
+        agg["차단됨"] = agg.apply(decide_block, axis=1)
 
-        df_all["차단됨"] = df_all.apply(is_blocked, axis=1)
+        final_cols = ["출처", "위협 IP", "위협 유형", "분석 일시", "차단됨"]
 
-        # 7) 컬럼 순서 설정 및 Malicious 컬럼 제거
-        cols = ["출처", "위협 IP", "위협 유형", "분석 일시", "차단됨"]
-        df_all = df_all[[c for c in cols if c in df_all.columns]]
+        # === 4) 안전 저장(임시파일 → 교체) ===
+        tmp_path = output_file + ".tmp.xlsx"
+        agg[final_cols].to_excel(tmp_path, index=False)
 
-        # 8) 엑셀로 저장 및 열 너비 자동 조정
+        # 열 너비 자동
         try:
-            df_all.to_excel(output_file, index=False)
-            QMessageBox.information(self, "✅ 저장 완료", f"통합 IP 목록 저장됨:\n{output_file}")
-            wb = load_workbook(output_file)
-            ws = wb.active
-            for column_cells in ws.columns:
-                max_len = max((len(str(cell.value)) if cell.value else 0) for cell in column_cells)
-                col_letter = get_column_letter(column_cells[0].column)
-                ws.column_dimensions[col_letter].width = max_len + 4
-            wb.save(output_file)
-        except Exception as e:
-            QMessageBox.critical(self, "❌ 저장 실패", str(e))
+            wb = load_workbook(tmp_path); ws = wb.active
+            for col in ws.columns:
+                w = max((len(str(c.value)) if c.value else 0) for c in col) + 4
+                ws.column_dimensions[get_column_letter(col[0].column)].width = w
+            wb.save(tmp_path)
+        except Exception:
+            pass
+
+        # 원본 교체
+        os.replace(tmp_path, output_file)
+
+        QMessageBox.information(
+            self, "✅ 통합 완료",
+            f"기존 파일에 이어서 병합되었습니다.\n총 고유 IP: {agg.shape[0]}\n저장 위치: {output_file}"
+        )
 
 
 if __name__ == "__main__":
