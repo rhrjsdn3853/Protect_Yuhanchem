@@ -22,6 +22,20 @@ from dotenv import load_dotenv
 
 load_dotenv()  # .env 있으면 로드
 
+# GPT 모델 및 사용 제약
+GPT_MODEL = "gpt-4o-mini"
+GPT_SCORE_MAX_PER_RUN = 30      # 한 번 실행에 최대 몇 개까지 GPT 판단할지(과금/속도 보호)
+GPT_SLEEP_BETWEEN_CALLS = 0.7   # 과한 QPS 방지(초)
+
+# VT 관계/커뮤니티 페이징(토큰/속도 절약)
+VT_REL_LIMIT = 20
+VT_CMT_LIMIT = 12
+VT_VOTE_LIMIT = 40
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
+
 VT_URL = 'https://www.virustotal.com/api/v3/ip_addresses/'
 
 def load_api_keys_from_env():
@@ -43,6 +57,95 @@ CACHE_TTL = timedelta(hours=24)
 
 
 WHITELIST_FILE = 'whitelist.txt'  # 한 줄당 1개: 단일 IP 또는 CIDR
+
+def _vt_get(url, api_key, params=None, timeout=18):
+    try:
+        r = requests.get(url, headers={"x-apikey": api_key}, params=params or {}, timeout=timeout)
+        if r.status_code == 200:
+            return r.json() or {}
+    except Exception:
+        pass
+    return {}
+
+def get_vt_context_for_ip(ip: str, api_key: str) -> dict:
+    base = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+    ctx = {"Votes_Malicious": 0, "Votes_Harmless": 0, "Comments": [],
+           "RelCounts": {}, "RelMaliciousFiles": {}}
+
+    votes = _vt_get(f"{base}/votes", api_key, params={"limit": VT_VOTE_LIMIT}).get("data", [])
+    verdicts = [ (item.get("attributes") or {}).get("verdict") for item in votes ]
+    c = Counter(v for v in verdicts if v)
+    ctx["Votes_Malicious"] = int(c.get("malicious", 0))
+    ctx["Votes_Harmless"]  = int(c.get("harmless", 0))
+
+    comments = _vt_get(f"{base}/comments", api_key, params={"limit": VT_CMT_LIMIT}).get("data", [])
+    texts = []
+    for item in comments:
+        txt = ((item.get("attributes") or {}).get("text") or "").strip()
+        if txt:
+            texts.append(txt[:280])
+    ctx["Comments"] = texts
+
+    for rel in ["communicating_files","downloaded_files","referrer_files","resolutions","related_urls"]:
+        data = _vt_get(f"{base}/{rel}", api_key, params={"limit": VT_REL_LIMIT}).get("data", []) or []
+        ctx["RelCounts"][rel] = len(data)
+        if rel.endswith("_files"):
+            mal = susp = 0
+            for it in data:
+                las = ((it or {}).get("attributes") or {}).get("last_analysis_stats", {}) or {}
+                mal  += int(las.get("malicious", 0) or 0)
+                susp += int(las.get("suspicious", 0) or 0)
+            ctx["RelMaliciousFiles"][rel] = {"malicious": mal, "suspicious": susp}
+    return ctx
+
+def gpt_score_ip(ip: str, vt_stats: dict, vt_ctx: dict) -> dict:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    summary = {
+        "ip": ip,
+        "stats": {
+            "malicious": int(vt_stats.get("Malicious", 0) or 0),
+            "suspicious": int(vt_stats.get("Suspicious", 0) or 0),
+            "harmless": int(vt_stats.get("Harmless", 0) or 0),
+            "undetected": int(vt_stats.get("Undetected", 0) or 0),
+        },
+        "votes": {
+            "malicious": vt_ctx.get("Votes_Malicious", 0),
+            "harmless": vt_ctx.get("Votes_Harmless", 0),
+        },
+        "rels": vt_ctx.get("RelCounts", {}),
+        "rel_file_mal": vt_ctx.get("RelMaliciousFiles", {}),
+        "comments_sample": vt_ctx.get("Comments", [])[:5],
+    }
+    system = ("당신은 숙련된 SOC 분석가입니다. 명확한 근거를 바탕으로 확실한 점수를 주세요. 악성 댓글이 있거나 안전하지 않은 relation이 있다면 확실히 높은 점수를 주세요. Malicious랑 Suspicious 개수는 점수에 반영하지 마세요."
+        "반드시 JSON만 반환하세요. 키: "
+        "risk_label(low|medium|high|critical), risk_score(0-100), "
+        "reason(한국어, 120자 이하).")
+    user = "다음 정보를 엄격히 바탕으로 평가하세요:\n" + json.dumps(summary, ensure_ascii=False)
+
+    try:
+        resp = client.chat.completions.create(
+            model=GPT_MODEL, temperature=0.2,
+            messages=[{"role":"system","content":system},
+                      {"role":"user","content":user}]
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        # 대비: 혹시 코드블럭이면 벗겨내기
+        if text.startswith("```"):
+            text = text.strip("` \n")
+            if "\n" in text: text = text.split("\n",1)[1]
+        result = json.loads(text)
+        return {
+            "risk_label": str(result.get("risk_label", "unknown")).lower(),
+            "risk_score": int(result.get("risk_score", 0) or 0),
+            "reason": (result.get("reason") or "")[:200],
+        }
+    except Exception:
+        return {"risk_label": "n/a", "risk_score": 0, "reason": ""}
+
+
+
+
+
 
 def load_whitelist(path: str = WHITELIST_FILE):
     """whitelist.txt에서 단일 IP 또는 CIDR을 읽어 ip_network들의 리스트로 리턴"""
@@ -106,16 +209,50 @@ class AnalysisThread(QThread):
                 df, count = self.process_waf(self.path)
                 stats_msg = f"🧹 제거된 대응 패턴 건수: {count}건"
 
+
+            df = self._shape_output(df)
+
             base, _ = os.path.splitext(self.path)
             output_file = f"{base}_result.xlsx"
             df.to_excel(output_file, index=False)
 
             wb = load_workbook(output_file)
             ws = wb.active
+
+            # (기존) 전체 열 너비 대략 자동 맞춤
             for column_cells in ws.columns:
                 max_length = max(len(str(cell.value)) if cell.value else 0 for cell in column_cells)
                 col_letter = get_column_letter(column_cells[0].column)
                 ws.column_dimensions[col_letter].width = max_length + 2
+
+            # === 추가: "위험 점수", "위험 근거" 특별 처리 ===
+            # 1) 헤더 → 컬럼 인덱스 매핑
+            header_idx = {str(cell.value): cell.column for cell in ws[1] if cell.value}
+
+            def _col_max_len(col_idx: int) -> int:
+                vals = []
+                for r in range(1, ws.max_row + 1):
+                    v = ws.cell(row=r, column=col_idx).value
+                    vals.append("" if v is None else str(v))
+                return max((len(x) for x in vals), default=0)
+
+            # 2) 위험 점수: 숫자(0~100)라 폭을 너무 넓히지 않도록 상한/하한 설정
+            if "위험 점수" in header_idx:
+                c = header_idx["위험 점수"]
+                w = max(8, min(_col_max_len(c) + 2, 14))   # 8~14자 사이
+                ws.column_dimensions[get_column_letter(c)].width = w
+                # 가운데 정렬(선택)
+                for r in range(2, ws.max_row + 1):
+                    ws.cell(row=r, column=c).alignment = Alignment(horizontal="center", vertical="center")
+
+            # 3) 위험 근거: 텍스트 길이에 맞추되 너무 길면 상한, 자동 줄바꿈 켜기
+            if "위험 근거" in header_idx:
+                c = header_idx["위험 근거"]
+                w = max(20, min(_col_max_len(c) + 4, 80))  # 20~80자 사이
+                ws.column_dimensions[get_column_letter(c)].width = w
+                for r in range(2, ws.max_row + 1):
+                    ws.cell(row=r, column=c).alignment = Alignment(wrap_text=True, vertical="top")
+
             wb.save(output_file)
 
             self.finished.emit(stats_msg, output_file)
@@ -128,10 +265,9 @@ class AnalysisThread(QThread):
         if not api_key_list:
             raise ValueError(f"알 수 없는 모드: {mode}")
 
-        # 1) 중복 제거
+        # 1) 화이트리스트 제외 + 중복 제거
         ip_list = [ip for ip in ip_list if not is_whitelisted(ip, self.whitelist_networks)]
         unique_ips = list(dict.fromkeys(ip_list))
-        
 
         # 2) 캐시 로드 & TTL 검사
         cache = load_cache()
@@ -143,74 +279,131 @@ class AnalysisThread(QThread):
                 to_query.append(ip)
             else:
                 entry_ts = datetime.fromisoformat(entry["ts"])
-                # tz-naive 값은 UTC로 간주
                 if entry_ts.tzinfo is None:
                     entry_ts = entry_ts.replace(tzinfo=timezone.utc)
                 if now - entry_ts >= CACHE_TTL:
                     to_query.append(ip)
 
-        # 3) 실제 API 호출은 to_query만
-        total = len(to_query)
-        self.total_count = total
+        # 3) 실제 API 호출은 to_query만 (429 발생 시 조기 종료)
+        total_planned = len(to_query)
+        processed = 0
+        self.total_count = total_planned
         self.current_index = 0
+        quota_exhausted = False
 
         for idx, ip in enumerate(to_query):
+            if quota_exhausted:
+                break
+
             self.current_index = idx
-            percent = int((idx + 1) / total * 100) if total else 100
+            processed = idx + 1
+            percent = int(processed / total_planned * 100) if total_planned else 100
             self.progress.emit(percent, ip)
 
             attempt = 0
             entry_data = None
 
-            while attempt < 3:
+            while attempt < 3 and not quota_exhausted:
                 api_key = api_key_list[idx % len(api_key_list)]
                 try:
-                    response = requests.get(VT_URL + ip,
-                                            headers={"x-apikey": api_key},
-                                            timeout=16)
+                    response = requests.get(
+                        VT_URL + ip,
+                        headers={"x-apikey": api_key},
+                        timeout=16
+                    )
+
+                    # ✅ 429: 쿼터 소진 → 지금까지 결과만 저장하고 루프 조기 종료
+                    if response.status_code == 429:
+                        print(f"[VT] 429 (quota exhausted). Stopping at {ip}.")
+                        quota_exhausted = True
+                        break
+
                     if response.status_code == 200:
                         print(f"[VT] {ip} 조회 성공")
-                        # 정상 응답일 때만 JSON 파싱
-                        data = response.json().get("data", {}).get("attributes", {})
-                        stats = data.get("last_analysis_stats", {})
+                        data_all = response.json() or {}
+                        attributes = (data_all.get("data") or {}).get("attributes", {}) or {}
+                        stats = attributes.get("last_analysis_stats", {}) or {}
                         entry_data = {
-                            "Malicious": stats.get("malicious", 0),
+                            "Malicious":  stats.get("malicious", 0),
                             "Suspicious": stats.get("suspicious", 0),
-                            "Phishing": stats.get("phishing", 0),
-                            "Clean": stats.get("clean", 0),
-                            "Harmless": stats.get("harmless", 0),
+                            "Phishing":   stats.get("phishing", 0),
+                            "Clean":      stats.get("clean", 0),
+                            "Harmless":   stats.get("harmless", 0),
                             "Undetected": stats.get("undetected", 0),
-                            "Country": data.get("country", "N/A"),
-                            "ASN": data.get("asn", "N/A"),
-                            "AS_Owner": data.get("as_owner", "N/A")
+                            "Country":    attributes.get("country", "N/A"),
+                            "ASN":        attributes.get("asn", "N/A"),
+                            "AS_Owner":   attributes.get("as_owner", "N/A"),
                         }
-                        break  # 성공했으니 retry 루프 종료
+                        break  # 성공
                     else:
                         print(f"[VT] {ip} 조회 실패 (코드 {response.status_code})")
-                        entry_data = {k: "Error" for k in [
-                            "Malicious","Suspicious","Phishing","Clean",
-                            "Harmless","Undetected","Country","ASN","AS_Owner"
-                        ]}
-                        break  # HTTP 에러 코드면 retry 하지 않고 빠져나감
+                        entry_data = {
+                            "Malicious":"Error","Suspicious":"Error","Phishing":"Error","Clean":"Error",
+                            "Harmless":"Error","Undetected":"Error","Country":"Error","ASN":"Error","AS_Owner":"Error"
+                        }
+                        break  # 비 200은 재시도하지 않음
+
                 except Exception as e:
                     print(f"[VT] {ip} 조회 오류: {e}")
                     attempt += 1
                     time.sleep(2 ** attempt)
 
+            # 429로 중단된 경우: 현재 ip는 캐시에 넣지 않고 곧바로 중단
+            if quota_exhausted:
+                break
+
             if entry_data is None:
-                entry_data = {k: "Error" for k in [
-                    "Malicious", "Suspicious", "Phishing", "Clean",
-                    "Harmless", "Undetected", "Country", "ASN", "AS_Owner"
-                ]}
+                entry_data = {
+                    "Malicious":"Error","Suspicious":"Error","Phishing":"Error","Clean":"Error",
+                    "Harmless":"Error","Undetected":"Error","Country":"Error","ASN":"Error","AS_Owner":"Error"
+                }
 
             # 4) 캐시에 저장
             cache[ip] = {"ts": now.isoformat(), "data": entry_data}
 
             time.sleep(DELAY_BY_MODE.get(mode, 15))
 
-        # 5) 캐시 영구 저장 & 최종 반환
+        # 5) 캐시 저장 & 결과 반환
         save_cache(cache)
-        return {ip: cache[ip]["data"] for ip in unique_ips}
+
+        # 진행률 마무리 (조기 종료든 아니든 UI 100%로 마감)
+        self.progress.emit(100, "")
+
+        # unique_ips 전부를 반환하되, 캐시에 없는(429 이후 미조회) IP는 빈 dict로 채움
+        return {ip: (cache.get(ip, {}).get("data", {})) for ip in unique_ips}
+
+    
+
+    def _shape_output(self, df: pd.DataFrame) -> pd.DataFrame:
+        drop_pool = {
+            "Timeout", "Malware",
+            "Votes_Malicious", "Votes_Harmless",
+            "Rel_Communicating_Files", "Rel_Downloaded_Files",
+            "Rel_Referrer_Files", "Rel_Resolutions", "Rel_Related_URLs",
+            "Rel_File_Malicious_Sum",
+            "Community_Comments",
+            "Risk_Label",
+        }
+        keep_cols = []
+        for c in df.columns:
+            if c in ("Risk_Score", "Risk_Reason"):
+                keep_cols.append(c)   # 유지
+            elif c in drop_pool:
+                continue              # 제거
+            else:
+                keep_cols.append(c)   # 나머지는 그대로 유지
+
+        out = df.loc[:, [c for c in keep_cols if c in df.columns]].copy()
+        # 한국어 컬럼명
+        out = out.rename(columns={
+            "Risk_Score": "위험 점수",
+            "Risk_Reason": "위험 근거",
+        })
+        return out
+
+        
+    
+
 
 
 
@@ -229,8 +422,12 @@ class AnalysisThread(QThread):
         df_final = df['공격자_공격명'].str.split(r' \|\| ', expand=True)
         df_final.columns = ['IP', 'Attack_Type']
         df_final['Attack_Type'] = df_final['Attack_Type'].str.replace(r'[\[\]]', '', regex=True).str.strip()
-        df_grouped = df_final.groupby('IP')['Attack_Type'].apply(lambda x: ', '.join(sorted(set(x)))).reset_index()
+        df_grouped = df_final.groupby('IP')['Attack_Type'] \
+            .apply(lambda x: ', '.join(sorted(set(x)))).reset_index()
+
         ip_info_cache = self.query_virustotal(df_grouped['IP'].tolist(), mode=self.mode)
+
+        # ✅ VT 결과를 병합해서 enriched를 먼저 채웁니다.
         enriched = []
         for _, row in df_grouped.iterrows():
             ip = row['IP']
@@ -240,24 +437,56 @@ class AnalysisThread(QThread):
                 **ip_info_cache.get(ip, {})
             })
 
+        # --- 여기서 GPT 스코어링 수행 ---
+        try:
+            vt_api_key = (API_KEYS.get(self.mode) or [None])[0]
+            gpt_targets = [e for e in enriched
+                        if isinstance(e.get("Malicious"), (int, float))
+                        and 1 <= int(e.get("Malicious") or 0) <= 2]
+            gpt_targets = gpt_targets[:GPT_SCORE_MAX_PER_RUN]
+
+            for t in gpt_targets:
+                ip = t.get("IP")
+                if not ip or not vt_api_key:
+                    continue
+                vt_ctx = get_vt_context_for_ip(ip, vt_api_key)
+                gpt = gpt_score_ip(ip, t, vt_ctx)
+                t.update({
+                    "Votes_Malicious": vt_ctx.get("Votes_Malicious", 0),
+                    "Votes_Harmless":  vt_ctx.get("Votes_Harmless", 0),
+                    "Rel_Communicating_Files": vt_ctx.get("RelCounts", {}).get("communicating_files", 0),
+                    "Rel_Downloaded_Files":    vt_ctx.get("RelCounts", {}).get("downloaded_files", 0),
+                    "Rel_Referrer_Files":      vt_ctx.get("RelCounts", {}).get("referrer_files", 0),
+                    "Rel_Resolutions":         vt_ctx.get("RelCounts", {}).get("resolutions", 0),
+                    "Rel_Related_URLs":        vt_ctx.get("RelCounts", {}).get("related_urls", 0),
+                    "Rel_File_Malicious_Sum": sum(
+                        (vt_ctx.get("RelMaliciousFiles", {}).get(k, {}).get("malicious", 0)
+                        for k in ["communicating_files","downloaded_files","referrer_files"]), 0),
+                    "Community_Comments": " | ".join(vt_ctx.get("Comments", [])[:3]),
+                    "Risk_Label":  gpt.get("risk_label"),
+                    "Risk_Score":  gpt.get("risk_score"),
+                    "Risk_Reason": gpt.get("reason"),
+                })
+                time.sleep(GPT_SLEEP_BETWEEN_CALLS)
+        except Exception:
+            pass
+
+        # (이하 캐시 저장 및 반환은 그대로)
         cache = load_cache()
         now = datetime.now(timezone.utc).isoformat()
         for entry in enriched:
             ip = entry["IP"]
             cache_entry = cache.get(ip, {"ts": now, "data": {}})
-            # 1) ts 유지 또는 초기화
             cache_entry["ts"] = cache_entry.get("ts", now)
-            # 2) VT 결과 전체 저장
             cache_entry["data"] = entry
-            # 3) 출처와 위협유형
-            cache_entry["source"]      = self.mode
+            cache_entry["source"] = self.mode
             cache_entry["threat_type"] = entry["Attack_Type"]
-            # 4) Malicious ≥ 1 이면 'V' 로 차단 표시
             mal = entry.get("Malicious", 0)
             cache_entry["blocked"] = "V" if isinstance(mal, (int, float)) and mal >= 1 else ""
             cache[ip] = cache_entry
         save_cache(cache)
         return pd.DataFrame(enriched), blocked_count
+        
 
     def process_waf(self, path):
         df = pd.read_csv(path, encoding='utf-8-sig', sep=',')
@@ -286,17 +515,54 @@ class AnalysisThread(QThread):
         # VirusTotal은 유니크 IP로 한 번만 조회
         ip_info_cache = self.query_virustotal(grouped['출발지 주소'].tolist(), mode="웹방화벽")
 
-        # 조회 결과 병합
         results = []
+
+        # ✅ grouped → results 채우기 (여기가 빠져 있었음)
         for _, row in grouped.iterrows():
             ip = row['출발지 주소']
-            rules_joined = row['룰']  # "SQLi, XSS, ..." 형태
+            rules_joined = row['룰']
             info = ip_info_cache.get(ip, {})
             results.append({
                 "출발지 주소": ip,
                 "룰": rules_joined,
                 **info
             })
+        
+
+        # --- 여기서 GPT 스코어링 ---
+        try:
+            vt_api_key = (API_KEYS.get("웹방화벽") or [None])[0]
+            gpt_targets = [e for e in results
+                        if isinstance(e.get("Malicious"), (int, float))
+                        and 1 <= float(e.get("Malicious") or 0) <= 2]
+            gpt_targets = gpt_targets[:GPT_SCORE_MAX_PER_RUN]
+
+            for t in gpt_targets:
+                ip = t.get("출발지 주소")
+                if not ip or not vt_api_key:
+                    continue
+                vt_ctx = get_vt_context_for_ip(ip, vt_api_key)
+                gpt = gpt_score_ip(ip, t, vt_ctx)
+                t.update({
+                    "Votes_Malicious": vt_ctx.get("Votes_Malicious", 0),
+                    "Votes_Harmless":  vt_ctx.get("Votes_Harmless", 0),
+                    "Rel_Communicating_Files": vt_ctx.get("RelCounts", {}).get("communicating_files", 0),
+                    "Rel_Downloaded_Files":    vt_ctx.get("RelCounts", {}).get("downloaded_files", 0),
+                    "Rel_Referrer_Files":      vt_ctx.get("R    elCounts", {}).get("referrer_files", 0),
+                    "Rel_Resolutions":         vt_ctx.get("RelCounts", {}).get("resolutions", 0),
+                    "Rel_Related_URLs":        vt_ctx.get("RelCounts", {}).get("related_urls", 0),
+                    "Rel_File_Malicious_Sum": sum(
+                        (vt_ctx.get("RelMaliciousFiles", {}).get(k, {}).get("malicious", 0)
+                        for k in ["communicating_files","downloaded_files","referrer_files"]), 0),
+                    "Community_Comments": " | ".join(vt_ctx.get("Comments", [])[:3]),
+                    "Risk_Label":  gpt.get("risk_label"),
+                    "Risk_Score":  gpt.get("risk_score"),
+                    "Risk_Reason": gpt.get("reason"),
+                })
+                time.sleep(GPT_SLEEP_BETWEEN_CALLS)
+        except Exception:
+            pass
+
         cache = load_cache()
         now = datetime.now(timezone.utc).isoformat()
         for entry in results:
@@ -308,7 +574,11 @@ class AnalysisThread(QThread):
             cache_entry["threat_type"] = entry["룰"]
             # Malicious 통계 보고 차단 여부 결정
             mal = entry.get("Malicious", 0)
-            cache_entry["blocked"]     = "V" if mal >= 1 else ""
+            try:
+                mal_val = float(mal)
+            except Exception:
+                mal_val = 0.0
+            cache_entry["blocked"] = "V" if mal_val >= 1 else ""
             cache[ip] = cache_entry
         save_cache(cache)
 
